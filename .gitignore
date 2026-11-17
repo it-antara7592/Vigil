@@ -1,0 +1,27 @@
+
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+
+# Frontend - Node
+node_modules/
+dist/
+
+# Backend - Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Django generated files
+staticfiles/
+media/
+
+# IDE
+.vscode/
+.idea/
+
+# Operating system
+.DS_Store
+Thumbs.db
