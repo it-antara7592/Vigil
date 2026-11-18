@@ -26,6 +26,7 @@ Vigil is a web-based cybersecurity awareness and learning platform designed to h
 - GitHub
 - Postman
 - Pytest
+- pytest-django
 - Vitest
 - React Testing Library
 
@@ -63,8 +64,6 @@ Install the following before setting up the project:
 - PostgreSQL
 
 ### 1. Clone the Repository
-
-Open a terminal and navigate to the directory where you want to keep the project.
 
 ```bash
 git clone https://github.com/it-antara7592/Vigil.git
@@ -118,7 +117,7 @@ npm run build
 
 ### 6. Navigate to the Backend
 
-Open a **new terminal** at the project root and run:
+Open a new terminal at the project root and run:
 
 ```powershell
 cd backend
@@ -208,6 +207,12 @@ To check the Django project configuration:
 python manage.py check
 ```
 
+To run backend tests:
+
+```powershell
+python manage.py test
+```
+
 ## Running Both Servers
 
 The frontend and backend run independently during development.
@@ -221,6 +226,20 @@ Open two separate terminals:
 
 Make sure the Python virtual environment is activated in the backend terminal before running Django commands.
 
+## Account Management
+
+The backend currently includes the foundation for:
+
+- Email and password registration and login.
+- Session-based authentication.
+- Learner and administrator account roles.
+- Account deletion requests with a recovery grace period.
+- Automatic cancellation of pending deletion after a successful login within the grace period.
+- Administrator replacement and approval workflow.
+- Reusable security audit event recording.
+
+Administrator accounts are provisioned through a restricted management process rather than public registration.
+
 ## Learning Access Approach
 
 - **Open learning:** Core courses and foundational lessons are accessible to everyone.
@@ -230,7 +249,9 @@ Make sure the Python virtual environment is activated in the backend terminal be
 
 ## Project Status
 
-Currently in initial development and setup.
+Vigil is currently in initial development.
+
+The frontend and backend foundations, PostgreSQL integration and initial account-management workflows have been established. Learning, assessment, simulation and progress features are part of the ongoing development.
 
 ## Safety and Privacy
 

@@ -1,4 +1,4 @@
-from django.contrib.auth.models import User
+from django.contrib.auth import authenticate, get_user_model
 from django.contrib.auth.password_validation import validate_password
 from django.contrib.auth.validators import UnicodeUsernameValidator
 from django.db import transaction
@@ -7,6 +7,7 @@ from rest_framework import serializers
 
 from .models import Profile
 
+User = get_user_model()
 
 class RegistrationSerializer(serializers.Serializer):
 
@@ -64,7 +65,6 @@ class RegistrationSerializer(serializers.Serializer):
     def create(self, validated_data):
 
         validated_data.pop('confirm_password')
-
         password = validated_data.pop('password')
 
         user = User.objects.create_user(
@@ -93,9 +93,6 @@ class RegistrationSerializer(serializers.Serializer):
         }
 
 
-from django.contrib.auth import authenticate
-from rest_framework import serializers
-
 class LoginSerializer(serializers.Serializer):
 
     email = serializers.EmailField()
@@ -119,3 +116,14 @@ class LoginSerializer(serializers.Serializer):
         attrs['user'] = user
 
         return attrs
+
+
+class AccountDeletionRequestSerializer(serializers.Serializer):
+
+    replacement_email = serializers.EmailField(
+        required=False,
+        allow_blank=True
+    )
+
+    def validate_replacement_email(self, value):
+        return value.strip().lower()
