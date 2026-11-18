@@ -43,6 +43,11 @@ INSTALLED_APPS = [
     'django.contrib.staticfiles',
     # Third-party applications
     'rest_framework',
+    'accounts',
+    'learning',
+    'assessments',
+    'simulations',
+    'progress',
 ]
 
 MIDDLEWARE = [
@@ -135,3 +140,16 @@ MAILERS = {
         'BACKEND': 'django.core.mail.backends.console.EmailBackend',
     },
 }
+
+REST_FRAMEWORK = {
+    'DEFAULT_AUTHENTICATION_CLASSES': [
+        'rest_framework.authentication.SessionAuthentication',
+    ],
+    'DEFAULT_PERMISSION_CLASSES': [
+        'rest_framework.permissions.IsAuthenticated',
+    ],
+}
+
+AUTHENTICATION_BACKENDS = [
+    'accounts.backends.EmailAuthenticationBackend',
+]
