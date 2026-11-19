@@ -1,19 +1,46 @@
+
+import hashlib
+import secrets
+
 from datetime import timedelta
+from zoneinfo import ZoneInfo
 
 from django.contrib.auth import get_user_model
 from django.core.exceptions import ValidationError
 from django.db import transaction
 from django.utils import timezone
 
-from .models import AccountDeletionRequest, SecurityAuditLog,Profile
+from .models import (
+    AccountDeletionRequest,
+    SecurityAuditLog,
+    Profile,
+    GuestIdentity,
+    GuestSession,
+)
 
 
 User = get_user_model()
 
+
+# Account deletion settings
 LEARNER_GRACE_PERIOD_DAYS = 15
 ADMIN_GRACE_PERIOD_DAYS = 30
 DELETION_COOLDOWN_DAYS = 10
 
+
+# Guest lifecycle settings
+GUEST_IDENTITY_LIFETIME_DAYS = 60
+GUEST_SESSION_LIFETIME_HOURS = 24
+
+GUEST_IDENTITY_COOKIE = 'vigil_guest_identity'
+GUEST_SESSION_COOKIE = 'vigil_guest_session'
+
+INDIA_TIMEZONE = ZoneInfo('Asia/Kolkata')
+
+
+# --------------------------------------------------
+# Audit events
+# --------------------------------------------------
 
 def record_audit_event(
     action,
@@ -34,6 +61,404 @@ def record_audit_event(
         metadata=metadata or {}
     )
 
+
+# --------------------------------------------------
+# Guest token helpers
+# --------------------------------------------------
+
+def generate_guest_token():
+    """
+    Generate a cryptographically secure guest token.
+    """
+
+    return secrets.token_urlsafe(32)
+
+
+def hash_guest_token(token):
+    """
+    Return the SHA-256 hash of a guest token.
+
+    Only token hashes are stored in the database.
+    """
+
+    return hashlib.sha256(
+        token.encode('utf-8')
+    ).hexdigest()
+
+
+# --------------------------------------------------
+# Guest identity and session creation
+# --------------------------------------------------
+
+@transaction.atomic
+def create_guest_session(guest_identity):
+    """
+    Create a new 24-hour session for an existing guest identity.
+
+    Any previous active session for the identity is deactivated.
+    """
+
+    locked_identity = (
+        GuestIdentity.objects
+        .select_for_update()
+        .get(pk=guest_identity.pk)
+    )
+
+    now = timezone.now()
+
+    if locked_identity.expires_at <= now:
+        raise ValidationError(
+            "Guest identity has expired."
+        )
+
+    GuestSession.objects.filter(
+        guest_identity=locked_identity,
+        is_active=True
+    ).update(is_active=False)
+
+    raw_token = generate_guest_token()
+
+    guest_session = GuestSession.objects.create(
+        guest_identity=locked_identity,
+        token_hash=hash_guest_token(raw_token),
+        expires_at=now + timedelta(
+            hours=GUEST_SESSION_LIFETIME_HOURS
+        )
+    )
+
+    return guest_session, raw_token
+
+
+@transaction.atomic
+def create_guest_identity():
+    """
+    Create a new guest identity and its first session.
+
+    Returns:
+        guest_identity,
+        raw_identity_token,
+        guest_session,
+        raw_session_token
+    """
+
+    now = timezone.now()
+
+    raw_identity_token = generate_guest_token()
+
+    guest_identity = GuestIdentity.objects.create(
+        token_hash=hash_guest_token(raw_identity_token),
+        expires_at=now + timedelta(
+            days=GUEST_IDENTITY_LIFETIME_DAYS
+        )
+    )
+
+    guest_session, raw_session_token = create_guest_session(
+        guest_identity
+    )
+
+    return (
+        guest_identity,
+        raw_identity_token,
+        guest_session,
+        raw_session_token
+    )
+
+
+# --------------------------------------------------
+# Returning guest recognition
+# --------------------------------------------------
+
+@transaction.atomic
+def get_or_create_guest(
+    identity_token=None,
+    session_token=None
+):
+    """
+    Recognise a returning guest or create a new guest identity.
+
+    A valid identity retains its usage records when its
+    24-hour session expires.
+
+    This function does not renew the 60-day identity lifetime.
+    Identity renewal happens only through record_guest_activity().
+
+    Returns:
+        guest_identity,
+        raw_identity_token,
+        guest_session,
+        raw_session_token
+    """
+
+    now = timezone.now()
+
+    guest_identity = None
+
+    if identity_token:
+        guest_identity = (
+            GuestIdentity.objects
+            .select_for_update()
+            .filter(
+                token_hash=hash_guest_token(identity_token)
+            )
+            .first()
+        )
+
+    # Remove an expired identity and its associated records.
+    if guest_identity and guest_identity.expires_at <= now:
+        guest_identity.delete()
+        guest_identity = None
+
+    # Create a new identity if none exists.
+    if guest_identity is None:
+        return create_guest_identity()
+
+    raw_identity_token = identity_token
+
+    # Check whether the existing session is valid.
+    guest_session = None
+
+    if session_token:
+        guest_session = (
+            GuestSession.objects
+            .select_for_update()
+            .filter(
+                guest_identity=guest_identity,
+                token_hash=hash_guest_token(session_token),
+                is_active=True,
+                expires_at__gt=now
+            )
+            .first()
+        )
+
+    # Reuse the existing valid session.
+    if guest_session:
+        return (
+            guest_identity,
+            raw_identity_token,
+            guest_session,
+            session_token
+        )
+
+    # Deactivate expired sessions.
+    GuestSession.objects.filter(
+        guest_identity=guest_identity,
+        is_active=True,
+        expires_at__lte=now
+    ).update(is_active=False)
+
+    # Create a replacement session while preserving the identity.
+    guest_session, raw_session_token = create_guest_session(
+        guest_identity
+    )
+
+    return (
+        guest_identity,
+        raw_identity_token,
+        guest_session,
+        raw_session_token
+    )
+
+
+# --------------------------------------------------
+# Guest session validation
+# --------------------------------------------------
+
+def validate_guest_session(
+    identity_token,
+    session_token
+):
+    """
+    Verify that the identity and session tokens are valid.
+
+    Validation alone does not renew the identity lifetime
+    or update activity timestamps.
+
+    Returns the GuestSession if valid, otherwise None.
+    """
+
+    if not identity_token or not session_token:
+        return None
+
+    now = timezone.now()
+
+    guest_session = (
+        GuestSession.objects
+        .select_related('guest_identity')
+        .filter(
+            guest_identity__token_hash=hash_guest_token(
+                identity_token
+            ),
+            guest_identity__expires_at__gt=now,
+            token_hash=hash_guest_token(session_token),
+            expires_at__gt=now,
+            is_active=True
+        )
+        .first()
+    )
+
+    return guest_session
+
+
+# --------------------------------------------------
+# Meaningful guest activity
+# --------------------------------------------------
+
+@transaction.atomic
+def record_guest_activity(guest_session):
+    """
+    Record meaningful activity from a validated guest session.
+
+    Renew the guest identity's 60-day inactivity period and
+    update the identity and session activity timestamps.
+
+    Returns True if activity was recorded, otherwise False.
+
+    Call this only for meaningful actions, such as:
+    - Opening or actively reading a lesson.
+    - Starting or participating in a quiz.
+    - Starting or participating in a simulation.
+
+    Do not call it for background requests, routine session
+    validation or ordinary landing-page browsing.
+    """
+
+    if guest_session is None:
+        return False
+
+    now = timezone.now()
+
+    # Lock the identity first to keep the same lock order
+    # used by guest session creation.
+    guest_identity = (
+        GuestIdentity.objects
+        .select_for_update()
+        .filter(
+            pk=guest_session.guest_identity_id,
+            expires_at__gt=now
+        )
+        .first()
+    )
+
+    if guest_identity is None:
+        return False
+
+    # Recheck the session while holding the identity lock.
+    locked_session = (
+        GuestSession.objects
+        .select_for_update()
+        .filter(
+            pk=guest_session.pk,
+            guest_identity=guest_identity,
+            is_active=True,
+            expires_at__gt=now
+        )
+        .first()
+    )
+
+    if locked_session is None:
+        return False
+
+    guest_identity.expires_at = now + timedelta(
+        days=GUEST_IDENTITY_LIFETIME_DAYS
+    )
+
+    guest_identity.save(
+        update_fields=[
+            'expires_at',
+            'last_seen_at'
+        ]
+    )
+
+    locked_session.last_seen_at = now
+
+    locked_session.save(
+        update_fields=['last_seen_at']
+    )
+
+    return True
+
+
+# --------------------------------------------------
+# Guest weekly period
+# --------------------------------------------------
+
+def get_current_guest_week_start(now=None):
+    """
+    Return the Monday date for the current guest usage week.
+
+    The week begins Monday at 00:00 in Asia/Kolkata time.
+
+    The returned value is a date, not a datetime.
+    """
+
+    if now is None:
+        now = timezone.now()
+
+    india_now = now.astimezone(INDIA_TIMEZONE)
+
+    return (
+        india_now.date()
+        - timedelta(days=india_now.weekday())
+    )
+
+
+# --------------------------------------------------
+# Guest session invalidation
+# --------------------------------------------------
+
+@transaction.atomic
+def end_guest_session(
+    identity_token=None,
+    session_token=None
+):
+    """
+    Invalidate the current guest session when a visitor
+    registers or logs in.
+
+    The guest identity and its usage records are preserved.
+    """
+
+    if not identity_token or not session_token:
+        return False
+
+    guest_identity = (
+        GuestIdentity.objects
+        .select_for_update()
+        .filter(
+            token_hash=hash_guest_token(identity_token)
+        )
+        .first()
+    )
+
+    if guest_identity is None:
+        return False
+
+    guest_session = (
+        GuestSession.objects
+        .select_for_update()
+        .filter(
+            guest_identity=guest_identity,
+            token_hash=hash_guest_token(session_token),
+            is_active=True
+        )
+        .first()
+    )
+
+    if guest_session is None:
+        return False
+
+    guest_session.is_active = False
+
+    guest_session.save(
+        update_fields=['is_active']
+    )
+
+    return True
+
+
+# --------------------------------------------------
+# Account deletion
+# --------------------------------------------------
 
 @transaction.atomic
 def create_deletion_request(user, replacement_email=None):
@@ -332,7 +757,7 @@ def process_due_deletion_requests():
             deletion_request.status = 'COMPLETED'
             deletion_request.completed_at = now
 
-            # Remove the nominated email from the retained history.
+            # Remove the nominated email from retained history.
             deletion_request.replacement_email = ''
 
             deletion_request.save(
@@ -355,14 +780,11 @@ def process_due_deletion_requests():
 
             # User deletion cascades to Profile and other
             # personal data according to their FK policies.
-            # AccountDeletionRequest and SecurityAuditLog use
-            # SET_NULL, preserving their limited audit history.
             user.delete()
 
             deleted_count += 1
 
     return deleted_count
-
 
 
 @transaction.atomic
@@ -400,6 +822,7 @@ def confirm_administrator_replacement_login(user):
     now = timezone.now()
 
     deletion_request.replacement_confirmed_at = now
+
     deletion_request.save(
         update_fields=['replacement_confirmed_at']
     )

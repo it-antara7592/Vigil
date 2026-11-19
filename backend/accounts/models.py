@@ -29,6 +29,96 @@ class Profile(models.Model):
         return f"{self.user.username} - {self.role}"
 
 
+class GuestIdentity(models.Model):
+
+    token_hash = models.CharField(
+        max_length=64,
+        unique=True
+    )
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    last_seen_at = models.DateTimeField(auto_now=True)
+    expires_at = models.DateTimeField()
+
+    def __str__(self):
+        return f"Guest identity #{self.pk}"
+
+
+class GuestSession(models.Model):
+
+    guest_identity = models.ForeignKey(
+        GuestIdentity,
+        on_delete=models.CASCADE,
+        related_name='sessions'
+    )
+
+    token_hash = models.CharField(
+        max_length=64,
+        unique=True
+    )
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    last_seen_at = models.DateTimeField(auto_now=True)
+    expires_at = models.DateTimeField()
+
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['guest_identity'],
+                condition=Q(is_active=True),
+                name='one_active_guest_session_per_identity'
+            ),
+        ]
+
+    def __str__(self):
+        return f"Guest session #{self.pk}"
+
+
+class GuestUsage(models.Model):
+
+    USAGE_TYPE_CHOICES = [
+        ('QUIZ', 'Quiz'),
+        ('SIMULATION', 'Simulation'),
+    ]
+
+    guest_identity = models.ForeignKey(
+        GuestIdentity,
+        on_delete=models.CASCADE,
+        related_name='usage_records'
+    )
+
+    usage_type = models.CharField(
+        max_length=12,
+        choices=USAGE_TYPE_CHOICES
+    )
+
+    week_start = models.DateField()
+
+    used_count = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=[
+                    'guest_identity',
+                    'usage_type',
+                    'week_start',
+                ],
+                name='unique_guest_weekly_usage'
+            ),
+        ]
+
+        ordering = ['-week_start']
+
+    def __str__(self):
+        return (
+            f"Guest #{self.guest_identity_id} - "
+            f"{self.usage_type} - {self.week_start}"
+        )
+
+
 class AccountDeletionRequest(models.Model):
 
     STATUS_CHOICES = [

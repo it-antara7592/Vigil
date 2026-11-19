@@ -1,7 +1,8 @@
 from django.contrib.auth import get_user_model
 from rest_framework import status
 from rest_framework.test import APITestCase
-from datetime import timedelta
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from django.utils import timezone
 
@@ -9,8 +10,26 @@ from .models import (
     Profile,
     AccountDeletionRequest,
     SecurityAuditLog,
+    GuestIdentity,
+    GuestSession,
+    GuestUsage,
 )
-from .services import process_due_deletion_requests
+from .services import (
+    process_due_deletion_requests,
+    generate_guest_token,
+    hash_guest_token,
+    create_guest_identity,
+    create_guest_session,
+    get_or_create_guest,
+    validate_guest_session,
+    record_guest_activity,
+    get_current_guest_week_start,
+    end_guest_session,
+    GUEST_IDENTITY_LIFETIME_DAYS,
+    GUEST_SESSION_LIFETIME_HOURS,
+    GUEST_IDENTITY_COOKIE,
+    GUEST_SESSION_COOKIE,
+)
 
 from io import StringIO
 from unittest.mock import patch
@@ -995,3 +1014,662 @@ class AdministratorReplacementEdgeCaseTests(APITestCase):
 
         self.assertEqual(deleted_count, 0)
         self.assertTrue(User.objects.filter(pk=old_admin.pk).exists())
+
+# --------------------------------------------------
+# Guest identity and session lifecycle tests
+# --------------------------------------------------
+
+class GuestIdentityAndSessionTests(APITestCase):
+
+    def setUp(self):
+        (
+            self.identity,
+            self.identity_token,
+            self.guest_session,
+            self.session_token,
+        ) = create_guest_identity()
+
+    def create_usage_record(self, identity=None):
+        return GuestUsage.objects.create(
+            guest_identity=identity or self.identity,
+            usage_type='QUIZ',
+            week_start=date(2026, 11, 16),
+            used_count=3,
+        )
+
+    def test_guest_tokens_are_random_and_only_hashes_are_stored(self):
+        another_token = generate_guest_token()
+
+        self.assertNotEqual(self.identity_token, another_token)
+        self.assertEqual(len(hash_guest_token(self.identity_token)), 64)
+
+        self.assertEqual(
+            self.identity.token_hash,
+            hash_guest_token(self.identity_token),
+        )
+        self.assertNotEqual(
+            self.identity.token_hash,
+            self.identity_token,
+        )
+        self.assertEqual(
+            self.guest_session.token_hash,
+            hash_guest_token(self.session_token),
+        )
+        self.assertNotEqual(
+            self.guest_session.token_hash,
+            self.session_token,
+        )
+
+    def test_new_identity_and_session_have_expected_lifetimes(self):
+        now = timezone.now()
+
+        identity_lifetime = (
+            self.identity.expires_at - now
+        ).total_seconds()
+
+        session_lifetime = (
+            self.guest_session.expires_at - now
+        ).total_seconds()
+
+        self.assertAlmostEqual(
+            identity_lifetime,
+            GUEST_IDENTITY_LIFETIME_DAYS * 24 * 60 * 60,
+            delta=2,
+        )
+        self.assertAlmostEqual(
+            session_lifetime,
+            GUEST_SESSION_LIFETIME_HOURS * 60 * 60,
+            delta=2,
+        )
+        self.assertTrue(self.guest_session.is_active)
+
+    def test_returning_guest_reuses_valid_identity_and_session(self):
+        result = get_or_create_guest(
+            self.identity_token,
+            self.session_token,
+        )
+
+        identity, identity_token, guest_session, session_token = result
+
+        self.assertEqual(identity.pk, self.identity.pk)
+        self.assertEqual(identity_token, self.identity_token)
+        self.assertEqual(guest_session.pk, self.guest_session.pk)
+        self.assertEqual(session_token, self.session_token)
+
+        self.assertEqual(GuestIdentity.objects.count(), 1)
+        self.assertEqual(GuestSession.objects.count(), 1)
+
+    def test_returning_guest_does_not_renew_identity_just_by_returning(self):
+        original_expiry = self.identity.expires_at
+        original_last_seen = self.identity.last_seen_at
+
+        get_or_create_guest(
+            self.identity_token,
+            self.session_token,
+        )
+
+        self.identity.refresh_from_db()
+
+        self.assertEqual(self.identity.expires_at, original_expiry)
+        self.assertEqual(self.identity.last_seen_at, original_last_seen)
+
+    def test_expired_session_gets_replaced_without_replacing_identity(self):
+        usage = self.create_usage_record()
+
+        self.guest_session.expires_at = (
+            timezone.now() - timedelta(seconds=1)
+        )
+        self.guest_session.save(update_fields=['expires_at'])
+
+        (
+            identity,
+            identity_token,
+            replacement_session,
+            replacement_token,
+        ) = get_or_create_guest(
+            self.identity_token,
+            self.session_token,
+        )
+
+        self.assertEqual(identity.pk, self.identity.pk)
+        self.assertEqual(identity_token, self.identity_token)
+        self.assertNotEqual(replacement_session.pk, self.guest_session.pk)
+        self.assertNotEqual(replacement_token, self.session_token)
+
+        self.guest_session.refresh_from_db()
+        self.assertFalse(self.guest_session.is_active)
+
+        self.assertTrue(replacement_session.is_active)
+        self.assertEqual(replacement_session.guest_identity_id, self.identity.pk)
+        self.assertTrue(GuestUsage.objects.filter(pk=usage.pk).exists())
+
+    def test_missing_session_cookie_creates_new_session_for_valid_identity(self):
+        (
+            identity,
+            identity_token,
+            replacement_session,
+            replacement_token,
+        ) = get_or_create_guest(
+            self.identity_token,
+            None,
+        )
+
+        self.assertEqual(identity.pk, self.identity.pk)
+        self.assertEqual(identity_token, self.identity_token)
+        self.assertNotEqual(replacement_session.pk, self.guest_session.pk)
+        self.assertNotEqual(replacement_token, self.session_token)
+
+        self.guest_session.refresh_from_db()
+        self.assertFalse(self.guest_session.is_active)
+
+    def test_missing_identity_creates_new_identity_and_session(self):
+        (
+            new_identity,
+            new_identity_token,
+            new_session,
+            new_session_token,
+        ) = get_or_create_guest(None, None)
+
+        self.assertNotEqual(new_identity.pk, self.identity.pk)
+        self.assertNotEqual(new_identity_token, self.identity_token)
+        self.assertNotEqual(new_session.pk, self.guest_session.pk)
+        self.assertNotEqual(new_session_token, self.session_token)
+
+        self.assertEqual(GuestIdentity.objects.count(), 2)
+
+    def test_expired_identity_is_deleted_and_replaced(self):
+        usage = self.create_usage_record()
+        old_identity_id = self.identity.pk
+
+        self.identity.expires_at = (
+            timezone.now() - timedelta(seconds=1)
+        )
+        self.identity.save(update_fields=['expires_at'])
+
+        (
+            new_identity,
+            new_identity_token,
+            new_session,
+            new_session_token,
+        ) = get_or_create_guest(
+            self.identity_token,
+            self.session_token,
+        )
+
+        self.assertNotEqual(new_identity.pk, old_identity_id)
+        self.assertNotEqual(new_identity_token, self.identity_token)
+        self.assertNotEqual(new_session_token, self.session_token)
+
+        self.assertFalse(
+            GuestIdentity.objects.filter(pk=old_identity_id).exists()
+        )
+        self.assertFalse(
+            GuestSession.objects.filter(
+                guest_identity_id=old_identity_id
+            ).exists()
+        )
+        self.assertFalse(GuestUsage.objects.filter(pk=usage.pk).exists())
+
+    def test_create_new_session_deactivates_previous_active_session(self):
+        new_session, new_token = create_guest_session(self.identity)
+
+        self.guest_session.refresh_from_db()
+
+        self.assertFalse(self.guest_session.is_active)
+        self.assertTrue(new_session.is_active)
+        self.assertNotEqual(new_session.pk, self.guest_session.pk)
+        self.assertEqual(
+            new_session.token_hash,
+            hash_guest_token(new_token),
+        )
+
+        self.assertEqual(
+            GuestSession.objects.filter(
+                guest_identity=self.identity,
+                is_active=True,
+            ).count(),
+            1,
+        )
+
+    def test_session_validation_accepts_valid_tokens(self):
+        result = validate_guest_session(
+            self.identity_token,
+            self.session_token,
+        )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.pk, self.guest_session.pk)
+
+    def test_session_validation_rejects_missing_tokens(self):
+        self.assertIsNone(
+            validate_guest_session(None, self.session_token)
+        )
+        self.assertIsNone(
+            validate_guest_session(self.identity_token, None)
+        )
+        self.assertIsNone(
+            validate_guest_session(None, None)
+        )
+
+    def test_session_validation_rejects_incorrect_tokens(self):
+        self.assertIsNone(
+            validate_guest_session(
+                'incorrect-identity-token',
+                self.session_token,
+            )
+        )
+        self.assertIsNone(
+            validate_guest_session(
+                self.identity_token,
+                'incorrect-session-token',
+            )
+        )
+
+    def test_session_validation_rejects_expired_session(self):
+        self.guest_session.expires_at = (
+            timezone.now() - timedelta(seconds=1)
+        )
+        self.guest_session.save(update_fields=['expires_at'])
+
+        self.assertIsNone(
+            validate_guest_session(
+                self.identity_token,
+                self.session_token,
+            )
+        )
+
+    def test_session_validation_rejects_inactive_session(self):
+        self.guest_session.is_active = False
+        self.guest_session.save(update_fields=['is_active'])
+
+        self.assertIsNone(
+            validate_guest_session(
+                self.identity_token,
+                self.session_token,
+            )
+        )
+
+    def test_session_validation_rejects_expired_identity(self):
+        self.identity.expires_at = (
+            timezone.now() - timedelta(seconds=1)
+        )
+        self.identity.save(update_fields=['expires_at'])
+
+        self.assertIsNone(
+            validate_guest_session(
+                self.identity_token,
+                self.session_token,
+            )
+        )
+
+    def test_validation_does_not_renew_identity_or_activity_timestamps(self):
+        original_expiry = self.identity.expires_at
+        original_identity_activity = self.identity.last_seen_at
+        original_session_activity = self.guest_session.last_seen_at
+
+        result = validate_guest_session(
+            self.identity_token,
+            self.session_token,
+        )
+
+        self.assertIsNotNone(result)
+
+        self.identity.refresh_from_db()
+        self.guest_session.refresh_from_db()
+
+        self.assertEqual(self.identity.expires_at, original_expiry)
+        self.assertEqual(
+            self.identity.last_seen_at,
+            original_identity_activity,
+        )
+        self.assertEqual(
+            self.guest_session.last_seen_at,
+            original_session_activity,
+        )
+
+    def test_meaningful_activity_renews_identity_lifetime(self):
+        old_expiry = timezone.now() + timedelta(days=5)
+
+        self.identity.expires_at = old_expiry
+        self.identity.save(update_fields=['expires_at'])
+
+        validated_session = validate_guest_session(
+            self.identity_token,
+            self.session_token,
+        )
+
+        result = record_guest_activity(validated_session)
+
+        self.assertTrue(result)
+
+        self.identity.refresh_from_db()
+        self.guest_session.refresh_from_db()
+
+        expected_expiry = (
+            timezone.now() + timedelta(days=GUEST_IDENTITY_LIFETIME_DAYS)
+        )
+
+        self.assertGreater(self.identity.expires_at, old_expiry)
+        self.assertAlmostEqual(
+            self.identity.expires_at.timestamp(),
+            expected_expiry.timestamp(),
+            delta=2,
+        )
+        self.assertGreaterEqual(
+            self.identity.last_seen_at,
+            self.guest_session.created_at,
+        )
+        self.assertGreaterEqual(
+            self.guest_session.last_seen_at,
+            self.guest_session.created_at,
+        )
+
+    def test_record_activity_does_not_extend_24_hour_session_expiry(self):
+        original_session_expiry = self.guest_session.expires_at
+
+        validated_session = validate_guest_session(
+            self.identity_token,
+            self.session_token,
+        )
+
+        self.assertTrue(record_guest_activity(validated_session))
+
+        self.guest_session.refresh_from_db()
+
+        self.assertEqual(
+            self.guest_session.expires_at,
+            original_session_expiry,
+        )
+
+    def test_record_activity_rejects_none(self):
+        self.assertFalse(record_guest_activity(None))
+
+    def test_record_activity_rejects_inactive_session(self):
+        validated_session = validate_guest_session(
+            self.identity_token,
+            self.session_token,
+        )
+
+        self.guest_session.is_active = False
+        self.guest_session.save(update_fields=['is_active'])
+
+        old_expiry = self.identity.expires_at
+
+        self.assertFalse(record_guest_activity(validated_session))
+
+        self.identity.refresh_from_db()
+        self.assertEqual(self.identity.expires_at, old_expiry)
+
+    def test_record_activity_rejects_expired_session(self):
+        validated_session = validate_guest_session(
+            self.identity_token,
+            self.session_token,
+        )
+
+        self.guest_session.expires_at = (
+            timezone.now() - timedelta(seconds=1)
+        )
+        self.guest_session.save(update_fields=['expires_at'])
+
+        old_expiry = self.identity.expires_at
+
+        self.assertFalse(record_guest_activity(validated_session))
+
+        self.identity.refresh_from_db()
+        self.assertEqual(self.identity.expires_at, old_expiry)
+
+    def test_end_session_invalidates_session_but_preserves_identity_and_usage(self):
+        usage = self.create_usage_record()
+
+        result = end_guest_session(
+            self.identity_token,
+            self.session_token,
+        )
+
+        self.assertTrue(result)
+
+        self.guest_session.refresh_from_db()
+        self.identity.refresh_from_db()
+
+        self.assertFalse(self.guest_session.is_active)
+        self.assertTrue(
+            GuestIdentity.objects.filter(pk=self.identity.pk).exists()
+        )
+        self.assertTrue(GuestUsage.objects.filter(pk=usage.pk).exists())
+
+    def test_end_session_rejects_incorrect_tokens(self):
+        result = end_guest_session(
+            self.identity_token,
+            'incorrect-session-token',
+        )
+
+        self.assertFalse(result)
+
+        self.guest_session.refresh_from_db()
+        self.assertTrue(self.guest_session.is_active)
+
+    def test_end_session_rejects_missing_tokens(self):
+        self.assertFalse(end_guest_session(None, self.session_token))
+        self.assertFalse(end_guest_session(self.identity_token, None))
+
+
+class GuestWeeklyPeriodTests(APITestCase):
+
+    def test_week_starts_on_monday_in_india_timezone(self):
+        india = ZoneInfo('Asia/Kolkata')
+
+        sunday_night = datetime(
+            2026, 11, 22, 23, 59, 59,
+            tzinfo=india,
+        )
+        monday_midnight = datetime(
+            2026, 11, 23, 0, 0, 0,
+            tzinfo=india,
+        )
+
+        self.assertEqual(
+            get_current_guest_week_start(sunday_night),
+            date(2026, 11, 16),
+        )
+        self.assertEqual(
+            get_current_guest_week_start(monday_midnight),
+            date(2026, 11, 23),
+        )
+
+    def test_week_start_uses_india_date_for_utc_timestamp(self):
+        # 2026-11-22 18:30 UTC is 2026-11-23 00:00 in India.
+        utc_timestamp = datetime(
+            2026, 11, 22, 18, 30, 0,
+            tzinfo=ZoneInfo('UTC'),
+        )
+
+        self.assertEqual(
+            get_current_guest_week_start(utc_timestamp),
+            date(2026, 11, 23),
+        )
+
+
+class GuestSessionEndpointTests(APITestCase):
+
+    url = '/api/accounts/guest-session/'
+
+    def test_first_guest_session_request_sets_both_cookies(self):
+        response = self.client.post(self.url, {}, format='json')
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(response.data['guest'])
+
+        self.assertIn(GUEST_IDENTITY_COOKIE, response.cookies)
+        self.assertIn(GUEST_SESSION_COOKIE, response.cookies)
+
+        identity_cookie = response.cookies[GUEST_IDENTITY_COOKIE]
+        session_cookie = response.cookies[GUEST_SESSION_COOKIE]
+
+        self.assertTrue(identity_cookie['httponly'])
+        self.assertTrue(session_cookie['httponly'])
+        self.assertEqual(identity_cookie['samesite'], 'Lax')
+        self.assertEqual(session_cookie['samesite'], 'Lax')
+
+        self.assertEqual(GuestIdentity.objects.count(), 1)
+        self.assertEqual(GuestSession.objects.count(), 1)
+
+    def test_guest_session_endpoint_reuses_cookies_on_return(self):
+        first_response = self.client.post(self.url, {}, format='json')
+
+        identity_token = first_response.cookies[
+            GUEST_IDENTITY_COOKIE
+        ].value
+        session_token = first_response.cookies[
+            GUEST_SESSION_COOKIE
+        ].value
+
+        self.client.cookies[GUEST_IDENTITY_COOKIE] = identity_token
+        self.client.cookies[GUEST_SESSION_COOKIE] = session_token
+
+        second_response = self.client.post(self.url, {}, format='json')
+
+        self.assertEqual(second_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(GuestIdentity.objects.count(), 1)
+        self.assertEqual(GuestSession.objects.count(), 1)
+
+        self.assertEqual(
+            second_response.cookies[GUEST_IDENTITY_COOKIE].value,
+            identity_token,
+        )
+        self.assertEqual(
+            second_response.cookies[GUEST_SESSION_COOKIE].value,
+            session_token,
+        )
+
+    def test_guest_session_endpoint_creates_new_session_after_expiry(self):
+        first_response = self.client.post(self.url, {}, format='json')
+
+        identity_token = first_response.cookies[
+            GUEST_IDENTITY_COOKIE
+        ].value
+        old_session_token = first_response.cookies[
+            GUEST_SESSION_COOKIE
+        ].value
+
+        old_session = GuestSession.objects.get(
+            token_hash=hash_guest_token(old_session_token)
+        )
+        old_session.expires_at = timezone.now() - timedelta(seconds=1)
+        old_session.save(update_fields=['expires_at'])
+
+        self.client.cookies[GUEST_IDENTITY_COOKIE] = identity_token
+        self.client.cookies[GUEST_SESSION_COOKIE] = old_session_token
+
+        response = self.client.post(self.url, {}, format='json')
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(GuestIdentity.objects.count(), 1)
+        self.assertEqual(GuestSession.objects.count(), 2)
+
+        self.assertNotEqual(
+            response.cookies[GUEST_SESSION_COOKIE].value,
+            old_session_token,
+        )
+
+        old_session.refresh_from_db()
+        self.assertFalse(old_session.is_active)
+
+
+class GuestAuthenticationTransitionTests(APITestCase):
+
+    def setUp(self):
+        (
+            self.identity,
+            self.identity_token,
+            self.guest_session,
+            self.session_token,
+        ) = create_guest_identity()
+
+        self.client.cookies[GUEST_IDENTITY_COOKIE] = self.identity_token
+        self.client.cookies[GUEST_SESSION_COOKIE] = self.session_token
+
+    def assert_guest_cookies_cleared(self, response):
+        self.assertIn(GUEST_IDENTITY_COOKIE, response.cookies)
+        self.assertIn(GUEST_SESSION_COOKIE, response.cookies)
+
+        self.assertEqual(
+            int(response.cookies[GUEST_IDENTITY_COOKIE]['max-age']),
+            0,
+        )
+        self.assertEqual(
+            int(response.cookies[GUEST_SESSION_COOKIE]['max-age']),
+            0,
+        )
+
+    def test_registration_ends_guest_session_and_clears_guest_cookies(self):
+        response = self.client.post(
+            '/api/accounts/register/',
+            {
+                'first_name': 'New',
+                'last_name': 'Learner',
+                'username': 'guestconverted',
+                'email': 'guestconverted@example.com',
+                'password': 'Vigil-Guest-Test-2026!xQ',
+                'confirm_password': 'Vigil-Guest-Test-2026!xQ',
+            },
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assert_guest_cookies_cleared(response)
+
+        self.guest_session.refresh_from_db()
+        self.assertFalse(self.guest_session.is_active)
+
+        self.assertTrue(
+            GuestIdentity.objects.filter(pk=self.identity.pk).exists()
+        )
+
+    def test_successful_login_ends_guest_session_and_clears_guest_cookies(self):
+        user = User.objects.create_user(
+            username='guestlogin',
+            email='guestlogin@example.com',
+            password='Vigil-Guest-Login-2026!xQ',
+        )
+        Profile.objects.create(user=user, role='LEARNER')
+
+        response = self.client.post(
+            '/api/accounts/login/',
+            {
+                'email': 'guestlogin@example.com',
+                'password': 'Vigil-Guest-Login-2026!xQ',
+            },
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assert_guest_cookies_cleared(response)
+
+        self.guest_session.refresh_from_db()
+        self.assertFalse(self.guest_session.is_active)
+
+        self.assertTrue(
+            GuestIdentity.objects.filter(pk=self.identity.pk).exists()
+        )
+
+    def test_failed_login_does_not_end_guest_session(self):
+        user = User.objects.create_user(
+            username='guestfailedlogin',
+            email='guestfailed@example.com',
+            password='Vigil-Guest-Login-2026!xQ',
+        )
+        Profile.objects.create(user=user, role='LEARNER')
+
+        response = self.client.post(
+            '/api/accounts/login/',
+            {
+                'email': 'guestfailed@example.com',
+                'password': 'Incorrect-Password-2026!xQ',
+            },
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+        self.guest_session.refresh_from_db()
+        self.assertTrue(self.guest_session.is_active)
